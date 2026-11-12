@@ -16,6 +16,7 @@ def run_analysis():
     gs = GridSpec(2, 3, height_ratios=[1.3, 1])
     ax_line = fig.add_subplot(gs[0, :])
     
+    # CORREÇÕES DE DESEMPACOTAMENTO APLICADAS AQUI
     _, I_base, _, grids_base = simulate(snapshots=[t_final])
     ax_line.plot(I_base, color=c_I, label='Sem Vacina', linewidth=2.5)
     
