@@ -18,7 +18,7 @@ Cada sítio da grade é um indivíduo descrito por uma tupla $(S, T)$, em que $S
 
 A cada passo de tempo, a atualização é síncrona. A pressão viral sentida pelo indivíduo $i$ combina um termo local, dado pelos 8 vizinhos de Moore (com contornos periódicos), e um termo de encontros casuais:
 
-$P_i(t) = W_L \sum_{j \in \mathcal{V}_i} T_j(t) + W_M \sum_{k=1}^{K} T_{j_k}(t),$
+$$P_i(t) = W_L \sum_{j \in \mathcal{V}_i} T_j(t) + W_M \sum_{k=1}^{K} T_{j_k}(t),$$
 
 em que $\mathcal{V}_i$ é a vizinhança de Moore de $i$ e os $K$ indivíduos $j_k$ são sorteados uniformemente em toda a população, de novo a cada passo, com peso $W_M < W_L$ por representarem contatos mais breves. Um suscetível é infectado com probabilidade
 
