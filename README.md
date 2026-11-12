@@ -114,9 +114,10 @@ Quarto semestre, na Ilum Escola de Ciência
 
 Quarto semestre, na Ilum Escola de Ciência
 
-[<img loading="lazy" src="https://github.com/matheusMNa.png" width=115><br><sub>[NOME COMPLETO]</sub>](https://github.com/matheusMNa)
+[<img loading="lazy" src="https://github.com/matheusMNa.png" width=115><br><sub>Matheus Macedo do Nascimento</sub>](https://github.com/matheusMNa)
 
 Quarto semestre, na Ilum Escola de Ciência
+
 ---
 
 # 🙏 Agradecimentos 🙏
