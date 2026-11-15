@@ -21,9 +21,9 @@
 #SBATCH --array=0-14
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=1
-#SBATCH --partition=PREENCHER_PARTICAO
-#SBATCH --mem=PREENCHER_MEMORIA
-#SBATCH --time=PREENCHER_TEMPO
+#SBATCH --partition=cpu
+#SBATCH --mem=4G
+#SBATCH --time=10:00:00
 # Referência para preencher. É uma estimativa, não uma medida no cluster: uma
 # execução Flu-like de 1500 passos levou de 1,8 a 2,3 s em outra CPU, o que dá
 # de 15 a 20 minutos por tarefa com TAMANHO_PEDACO=500 (500 execuções em um núcleo).
@@ -46,6 +46,8 @@ export NUMEXPR_NUM_THREADS=1
 #   module load <módulo do conda>
 #   conda activate small-world
 
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate small-world
 cd "${SLURM_SUBMIT_DIR:-.}"
 
 python analyses/ensemble.py \
