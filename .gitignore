@@ -1,0 +1,7 @@
+# resultados do ensemble e logs do cluster
+results/
+logs/
+
+# cache do Python
+__pycache__/
+*.pyc

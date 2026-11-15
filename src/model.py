@@ -2,11 +2,12 @@ import numpy as np
 from scipy.signal import convolve2d
 
 def simulate(N=100, alpha=0.08, p_rec=0.05, steps=150, W_local=1.0, W_mercado=0.4, 
-             K_encontros=3, init_cluster=3, init_scattered=0, vac_rate=0.0, vac_time=0, snapshots=None):
+             K_encontros=3, init_cluster=3, init_scattered=0, vac_rate=0.0, vac_time=0, snapshots=None,
+             seed=42):
     if snapshots is None:
         snapshots = [0, steps]
 
-    np.random.seed(42)
+    np.random.seed(seed)
     S_base = np.random.uniform(0.2, 1.0, (N, N))
     T_base = np.random.uniform(0.2, 1.0, (N, N))
     S_curr, T_curr = np.copy(S_base), np.zeros((N, N))

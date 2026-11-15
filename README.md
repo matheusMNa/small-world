@@ -44,6 +44,111 @@ Para comparação, `analyses/global_analysis.py` resolve um SIR de campo médio 
 
 ---
 
+# 💉 Vacinação com desgaste e reforço 💉
+
+O módulo `src/model_vacinacao.py` estende o modelo acima sem alterar a dinâmica de contágio. Cada indivíduo passa a ter uma imunidade $m \in [0, 1]$, que reduz a suscetibilidade de quem não está infectado e a transmissibilidade de quem está:
+
+$$S_i^{\text{ef}} = S_i^0\,(1 - m_i), \qquad T_i^{\text{ef}} = T_i^0\,(1 - m_i).$$
+
+A imunidade é a maior entre a vacinal e a natural, $m = \max(m_{\text{vac}}, m_{\text{nat}})$. Cada dose gera uma curva de Bateman, com subida rápida e decaimento lento, em que $\tau$ é o número de passos desde a dose:
+
+$$b(\tau) = A\left(e^{-\tau/\tau_d} - e^{-\tau/\tau_r}\right), \qquad \tau^* = \frac{\tau_r\,\tau_d}{\tau_d - \tau_r}\ln\frac{\tau_d}{\tau_r},$$
+
+com $A$ escolhido para que o pico valha 1 em $\tau = \tau^*$. A imunidade vacinal é o máximo das curvas das duas doses mais recentes. A imunidade natural vale 1 no instante da recuperação e decai como $e^{-\tau/\tau_n}$. O modelo é simulado para duas doenças:
+
+| Parâmetro | Flu-like | Measles-like |
+|---|---|---|
+| $\tau_r$, subida da curva vacinal | 3 | 3 |
+| $\tau_d$, primeira dose | 100 | $\infty$ |
+| $\tau_d$, doses seguintes | 150 | não se aplica |
+| $\tau_n$, imunidade natural | 100 | $\infty$ (permanente) |
+| Reforço | sim, com $\tau_b = 20$ | não |
+
+No Flu-like, um vacinado não infectado cuja última dose já passou do pico e cuja imunidade caiu abaixo de 0,5 toma uma dose de reforço, a cada passo, com probabilidade $p_b(u) = 1 - e^{-u/\tau_b}$, em que $u$ é o número de passos desde que $m$ cruzou 0,5. Esses valores são escolhas de modelagem, sem calibração empírica.
+
+A primeira dose segue um de três regimes: 50% dos elegíveis em $t = 0$; 50% dos elegíveis em $t = 60$; ou 50 doses por passo a partir de $t = 0$, até 5000 doses. É elegível quem nunca foi vacinado e não está infectado. A alocação é aleatória ou em grupos de risco, caso em que o sorteio sem reposição tem peso gaussiano na suscetibilidade intrínseca, $w_i \propto \exp[-(S_i^0 - 1)^2 / 2\sigma^2]$ com $\sigma = 0{,}2$. "Grupo de risco" significa apenas maior suscetibilidade à infecção; o modelo não tem gravidade nem mortalidade.
+
+Cada infecção é atribuída a um transmissor por riscos competitivos: dado que $i$ foi infectado, a fonte é o contato $j$ com probabilidade proporcional a $W_{ij}\,T_j^{\text{ef}}$. Infecções e transmissões são contadas por faixa de status no instante do evento: nunca vacinado, ou vacinado com $m \ge 0{,}90$, $0{,}75 \le m < 0{,}90$, $0{,}50 \le m < 0{,}75$ ou $m < 0{,}50$. Como as porcentagens de eventos dependem de quantas pessoas estão em cada faixa, as figuras mostram também as taxas por pessoa-passo, em que só contam os passos com ao menos um infectado.
+
+## Cenários
+
+| Código | Doença | Primeira dose | Alocação | Reforços |
+|---|---|---|---|---|
+| F0, M0 | Flu-like, Measles-like | sem vacina | n/a | não |
+| F1, M1 | Flu-like, Measles-like | $t = 0$ | aleatória | só no Flu-like |
+| F2, M2 | Flu-like, Measles-like | $t = 0$ | gaussiana | só no Flu-like |
+| F3, M3 | Flu-like, Measles-like | $t = 60$ | aleatória | só no Flu-like |
+| F4, M4 | Flu-like, Measles-like | $t = 60$ | gaussiana | só no Flu-like |
+| F5, M5 | Flu-like, Measles-like | contínua | aleatória | só no Flu-like |
+| F6, M6 | Flu-like, Measles-like | contínua | gaussiana | só no Flu-like |
+| F7 | Flu-like | $t = 0$ | aleatória | não (controle) |
+
+O ensemble usa as seeds 0 a 499 em cada cenário e 1500 passos. A seed define os atributos $S^0$ e $T^0$, a dinâmica e o sorteio de vacinados por três fluxos aleatórios independentes, de modo que a seed $k$ produz a mesma população em todos os cenários.
+
+## Arquivos
+
+| Arquivo | Conteúdo |
+|---|---|
+| `src/model_vacinacao.py` | Modelo, definição dos 15 cenários e métricas derivadas |
+| `analyses/ensemble.py` | Roda os cenários e grava um `.npz` por pedaço de seeds em `results/pedacos/` |
+| `analyses/juntar_pedacos.py` | Confere as seeds e reúne os pedaços em `results/<código>.npz` |
+| `analyses/figuras_vacinacao.py` | Gera as figuras `05` a `12` e a tabela `resumo_vacinacao.csv` em `analyses/plots/` a partir de `results/`, sem simular |
+| `cluster/ensemble_array.slurm` | Job array do SLURM, com campos a preencher (não testado em cluster) |
+| `tests/test_model_vacinacao.py` | Testes do modelo |
+
+## Como rodar
+
+Todos os comandos são executados a partir da raiz do repositório, no mesmo ambiente Conda.
+
+1. Testes (cerca de meio minuto):
+
+   ```bash
+   python tests/test_model_vacinacao.py
+   ```
+
+2. Verificação rápida do fluxo completo, com 3 seeds e 400 passos, em uma pasta temporária:
+
+   ```bash
+   python analyses/ensemble.py --seed-fim 3 --horizonte 400 --saida /tmp/teste/pedacos
+   python analyses/juntar_pedacos.py --n-seeds 3 --pedacos /tmp/teste/pedacos --saida /tmp/teste
+   python analyses/figuras_vacinacao.py --resultados /tmp/teste --saida /tmp/teste/plots --dpi 80
+   ```
+
+3. Ensemble completo em uma máquina só, com 8 processos:
+
+   ```bash
+   python analyses/ensemble.py --processos 8
+   ```
+
+   Ou em um cluster com SLURM, depois de preencher partição, memória, tempo e ambiente em `cluster/ensemble_array.slurm`:
+
+   ```bash
+   mkdir -p logs results/pedacos
+   sbatch cluster/ensemble_array.slurm
+   ```
+
+   Nos dois casos, pedaços já gravados são pulados, então basta relançar o mesmo comando para retomar uma execução interrompida.
+
+4. Junção e figuras:
+
+   ```bash
+   python analyses/juntar_pedacos.py
+   python analyses/figuras_vacinacao.py
+   ```
+
+   A junção falha, dizendo quais seeds faltam ou se repetem, se algum cenário não tiver exatamente as seeds 0 a 499. Cada figura com banda de erro sai em duas versões: `_dp` (desvio padrão entre seeds) e `_ep` (erro padrão da média).
+
+Para usar o modelo diretamente:
+
+```python
+from src.model_vacinacao import parametros_cenario, simular
+
+res = simular(parametros_cenario("F1", horizonte=400), seed=0)
+infectados = res["n_inf_faixa"].sum(axis=1)
+```
+
+---
+
 # 🛠️ Tecnologias utilizadas 🛠️
 
 ## IA

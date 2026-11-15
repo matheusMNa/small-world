@@ -9,67 +9,6 @@ from src.model import simulate
 
 def run_analysis():
     c_S, c_I, c_R = '#56B4E9', '#D55E00', '#009E73'
-    c_cinza = '#E0E0E0' # Cor neutra para o filtro visual
-    
-    cmap_normal = ListedColormap([c_S, c_I, c_R])
-    
-    # Rodamos o modelo com 50% vacinados em t=0 para forçar a quebra da percolação
-    _, _, _, grids_v = simulate(vac_rate=0.5, vac_time=0, snapshots=[0, 150])
-    
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-    
-    # 1. Matriz Inicial Normal
-    axes[0].imshow(grids_v[0], cmap=cmap_normal, vmin=0, vmax=2)
-    axes[0].set_title('Microestado Inicial (t=0)', fontsize=14)
-    axes[0].axis('off')
-    
-    # 2. Matriz Final Normal
-    axes[1].imshow(grids_v[150], cmap=cmap_normal, vmin=0, vmax=2)
-    axes[1].set_title('Estado Final (t=150)', fontsize=14)
-    axes[1].axis('off')
-    
-    # 3. FILTRO DE SOBREVIVÊNCIA (Isolando os Clusters / Ilhas)
-    # 0 = Suscetível, 1 = Infectado, 2 = Recuperado/Vacinado
-    # Vamos criar uma matriz onde tudo que NÃO for 0 (Suscetível) fica cinza
-    grid_filtrada = np.copy(grids_v[150])
-    # Trocamos o valor dos Suscetíveis(0) para 1, e dos demais(1, 2) para 0
-    filtro_visual = np.where(grid_filtrada == 0, 1, 0)
-    
-    # Colormap que acende Suscetíveis (Azul) e apaga o resto (Cinza)
-    cmap_filtro = ListedColormap([c_cinza, c_S])
-    
-    axes[2].imshow(filtro_visual, cmap=cmap_filtro, vmin=0, vmax=1)
-    axes[2].set_title('Separação de Fase', fontsize=14)
-    axes[2].axis('off')
-    
-    plt.suptitle('Teoria da Percolação', fontsize=16, y=1.05)
-    
-    legend_elements = [
-        Patch(facecolor=c_S, edgecolor='k', label='Suscetíveis Preservados (Clusters)'),
-        Patch(facecolor=c_I, edgecolor='k', label='Infectados Ativos'),
-        Patch(facecolor=c_R, edgecolor='k', label='Recuperados / Vacinados'),
-        Patch(facecolor=c_cinza, edgecolor='k', label='Material Inerte (Vac+Rec)')
-    ]
-    fig.legend(handles=legend_elements, loc='lower center', ncol=4, fontsize=12, bbox_to_anchor=(0.5, -0.05))
-    
-    plt.tight_layout()
-    plt.savefig('analyses/plots/04_separacao_fase.png', dpi=300, bbox_inches='tight')
-    plt.show()
-
-if __name__ == "__main__":
-    run_analysis()
-
-import sys, os
-import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.colors import ListedColormap
-from matplotlib.patches import Patch
-
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from src.model import simulate
-
-def run_analysis():
-    c_S, c_I, c_R = '#56B4E9', '#D55E00', '#009E73'
     c_cinza = '#E0E0E0' 
     
     cmap_normal = ListedColormap([c_S, c_I, c_R])
