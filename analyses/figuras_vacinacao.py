@@ -1,20 +1,28 @@
 """
-Gera as figuras 05 a 12 do modelo de vacinação a partir de ``results/<código>.npz``.
+Gera as figuras 05 a 19 do modelo de vacinação a partir de ``results/<código>.npz``.
 
 Este script só lê os arquivos do ensemble; ele nunca roda simulações. Toda
 figura com banda ou barra de erro sai em duas versões: ``_dp`` (média ±
 desvio padrão entre seeds) e ``_ep`` (média ± erro padrão da média).
-Grava também ``resumo_vacinacao.csv``, com as métricas de cada cenário na
-simulação inteira e só na primeira onda. Faixas: 0 = nunca vacinado,
-1 = m ≥ 0,90, 2 = 0,75 ≤ m < 0,90, 3 = 0,50 ≤ m < 0,75, 4 = m < 0,50.
+Grava também ``resumo_vacinacao.csv``, com as métricas de cada configuração.
+Faixas: 0 = nunca vacinado, 1 = m ≥ 0,90, 2 = 0,75 ≤ m < 0,90,
+3 = 0,50 ≤ m < 0,75, 4 = m < 0,50.
+
+As figuras 05 a 12 (definidas aqui) saem uma vez para cada condição inicial:
+sufixo ``_C`` (9 infectados em bloco central) e ``_E`` (9 espalhados). As
+figuras 13 a 19 estão em ``analyses/figuras_complementares.py``: evolução
+espacial, comparação com EDO, semente inicial, conexões globais, regimes de
+vacinação, percolação e comparação entre as duas condições iniciais.
 
 Exemplo, a partir da raiz do repositório::
 
     python analyses/figuras_vacinacao.py
+    python analyses/figuras_vacinacao.py --figuras 05 17 18          # só algumas
     python analyses/figuras_vacinacao.py --resultados /tmp/teste --saida /tmp/teste/plots --dpi 80
 """
 import argparse
 import csv
+import json
 import os
 import sys
 import warnings
@@ -28,7 +36,8 @@ from matplotlib.lines import Line2D
 from matplotlib.patches import Patch
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from src.model_vacinacao import CENARIOS, participacao_vacinados, primeira_onda, taxas_por_faixa
+from src.model_vacinacao import (CENARIOS, CONFIGURACOES, participacao_vacinados, primeira_onda,
+                                 taxas_por_faixa)
 
 # Paleta do repositório (Okabe-Ito). A cor acompanha o tipo de cenário em todas as figuras.
 COR_SEM_VACINA = '#D55E00'
@@ -45,6 +54,9 @@ REGIMES = (("em t = 0", {"flu": ("F1", "F2"), "measles": ("M1", "M2")}),
 SEM_VACINA = {"flu": "F0", "measles": "M0"}
 NOME_DOENCA = {"flu": "Flu-like", "measles": "Measles-like"}
 NOME_BANDA = {"dp": "desvio padrão", "ep": "erro padrão"}
+NOME_CONDICAO = {"C": "9 em bloco central", "E": "9 espalhados pela grade"}
+# Um surto é "falho" quando menos desta fração da população chega a se infectar.
+LIMIAR_SURTO_FALHO = 0.10
 
 
 # ---------------------------------------------------------------------------
@@ -124,32 +136,91 @@ def resumir_cenario(caminho):
 
     r["extintas"] = float(np.mean(d["t_extincao"] >= 0))
     r["t_extincao"] = d["t_extincao"]
-    r["grades"] = {k: d[k] for k in ("grades_seeds", "grades_tempos", "grades_m", "grades_infectado")}
+    r["grades"] = {k: d[k] for k in ("grades_seeds", "grades_tempos", "grades_m", "grades_infectado",
+                                     "grades_estado") if k in d}
+
+    # --- grandezas por seed, usadas nas figuras 13 a 19 ---
+    r["seeds"] = d["seeds"]
+    r["param"] = json.loads(str(d["parametros_json"]))
+    r["I_seeds"] = I.astype(np.int32)
+    pop = float(hist[0].sum())
+    r["pop"] = pop
+    r["final_seeds"] = 1.0 - hist[:, 0] / pop              # fração da população que já se infectou
+    r["pico_altura_seeds"] = I.max(axis=1).astype(float)
+    r["pico_t_seeds"] = I.argmax(axis=1).astype(float)
+    r["falho_seeds"] = r["final_seeds"] < LIMIAR_SURTO_FALHO
+    metricas = {"pct_populacao_ja_infectada": 100 * r["final_seeds"],
+                "pico_maximo_de_infectados": r["pico_altura_seeds"],
+                "passo_do_pico_maximo": r["pico_t_seeds"]}
+    if "n_estado" in d:      # ausente nos arquivos da primeira rodada
+        r["estado"] = estat(d["n_estado"].astype(np.float32))              # (T+1, 4)
+        r["perc"] = {k: d[k] for k in ("perc_tempos", "perc_p", "perc_pinf", "perc_n_aglom",
+                                       "perc_envolve", "perc_s_medio", "perc_hist")}
+        metricas["primeiras_doses_em_recuperados"] = d["doses1_em_recuperados"]
+        for j, t in enumerate(d["perc_tempos"]):
+            metricas[f"fracao_suscetiveis_t{int(t)}"] = d["perc_p"][:, j]
+            metricas[f"fracao_no_maior_aglomerado_t{int(t)}"] = d["perc_pinf"][:, j]
+            metricas[f"maior_aglomerado_envolve_o_toro_t{int(t)}"] = d["perc_envolve"][:, j].astype(float)
+    for nome, valores in metricas.items():
+        e = estat(valores)
+        linhas.append(("total", nome, float(e["media"]), float(e["dp"]), float(e["ep"]), int(e["n"])))
+    linhas.append(("total", "fracao_surtos_falhos", float(r["falho_seeds"].mean()), float("nan"),
+                   float("nan"), n_seeds))
     return r
 
 
-def carregar(pasta):
-    """Resumos de todos os cenários presentes em ``pasta``."""
-    resumos = {}
-    for codigo in CENARIOS:
+def carregar(pasta, codigos=None):
+    """Resumos de todas as configurações presentes em ``pasta``, pela chave do código (``"F1C"``...).
+
+    Se a pasta só tiver os arquivos da primeira rodada (``F0.npz`` ... ``M6.npz``,
+    sem sufixo), eles são lidos como condição C: é o que eles são.
+    """
+    pasta = str(pasta)
+    resumos, faltando = {}, []
+    for codigo in (codigos or CONFIGURACOES):
         caminho = os.path.join(pasta, f"{codigo}.npz")
         if os.path.exists(caminho):
             resumos[codigo] = resumir_cenario(caminho)
         else:
-            print(f"[aviso] {caminho} não existe; o cenário {codigo} fica fora das figuras")
+            faltando.append(codigo)
+    antigos = [b for b in CENARIOS if f"{b}C" in faltando and os.path.exists(os.path.join(pasta, f"{b}.npz"))]
+    for base in antigos:
+        resumos[f"{base}C"] = resumir_cenario(os.path.join(pasta, f"{base}.npz"))
+        faltando.remove(f"{base}C")
+    if antigos:
+        print(f"[aviso] {', '.join(antigos)}: lidos de arquivos da primeira rodada (sem sufixo), como condição C; "
+              "eles não têm estados nem percolação")
+    if faltando:
+        print(f"[aviso] sem arquivo em {pasta} para: {', '.join(faltando)}. "
+              "Essas configurações ficam fora das figuras.")
     return resumos
 
 
+def por_condicao(resumos, cond):
+    """Os 15 cenários de uma condição inicial ("C" ou "E"), pela chave do cenário (``"F1"``...)."""
+    return {base: resumos[f"{base}{cond}"] for base in CENARIOS if f"{base}{cond}" in resumos}
+
+
+def anotar_condicao(fig, cond):
+    """Escreve a condição inicial acima do título da figura. Devolve a própria figura."""
+    if fig is not None:
+        y = fig._suptitle.get_position()[1] if fig._suptitle is not None else 1.0
+        fig.text(0.5, y + 0.015, f"Infectados iniciais: {NOME_CONDICAO[cond]}", ha='center', va='bottom',
+                 fontsize=12, color='#444444')
+    return fig
+
+
 def gravar_tabela(resumos, caminho):
-    """Grava as métricas de todos os cenários em CSV (uma linha por cenário, janela e métrica)."""
+    """Grava as métricas de todas as configurações em CSV (uma linha por configuração, janela e métrica)."""
     with open(caminho, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["cenario", "n_seeds", "horizonte", "janela", "metrica", "media", "desvio_padrao",
-                    "erro_padrao", "n_seeds_validas"])
+        w.writerow(["configuracao", "cenario", "grupo", "condicao_inicial", "n_seeds", "horizonte", "janela",
+                    "metrica", "media", "desvio_padrao", "erro_padrao", "n_seeds_validas"])
         for codigo, r in resumos.items():
+            conf = CONFIGURACOES.get(codigo, dict(base=codigo, grupo="", condicao=""))
             for janela, nome, media, dp, ep, n in r["tabela"]:
-                w.writerow([codigo, r["n_seeds"], r["horizonte"], janela, nome,
-                            f"{media:.6g}", f"{dp:.6g}", f"{ep:.6g}", n])
+                w.writerow([codigo, conf["base"], conf["grupo"], conf["condicao"], r["n_seeds"], r["horizonte"],
+                            janela, nome, f"{media:.6g}", f"{dp:.6g}", f"{ep:.6g}", n])
     print(f"[ok] {caminho}")
 
 
@@ -424,7 +495,10 @@ def fig_grades(resumos, seed=0):
     usados = [c for c in ("F1", "F2") if c in resumos and seed in resumos[c]["grades"]["grades_seeds"]]
     if not usados:
         return None
-    tempos = resumos[usados[0]]["grades"]["grades_tempos"]
+    todos_tempos = [int(t) for t in resumos[usados[0]]["grades"]["grades_tempos"]]
+    horizonte = resumos[usados[0]]["horizonte"]
+    # o ensemble guarda mais instantes (figuras 13 e 18); esta figura usa quatro
+    tempos = [t for t in (0, 60, 300, horizonte) if t in todos_tempos] or todos_tempos
     fig, axes = plt.subplots(len(usados), len(tempos), figsize=(4.1 * len(tempos), 4.3 * len(usados)),
                              squeeze=False)
     cmap_inf = ListedColormap([(0, 0, 0, 0), COR_SEM_VACINA])
@@ -434,8 +508,9 @@ def fig_grades(resumos, seed=0):
         k = int(np.flatnonzero(g["grades_seeds"] == seed)[0])
         for j, t in enumerate(tempos):
             ax = axes[i, j]
-            im = ax.imshow(g["grades_m"][k, j], cmap='Blues', vmin=0, vmax=1, interpolation='nearest')
-            ax.imshow(g["grades_infectado"][k, j].astype(int), cmap=cmap_inf, vmin=0, vmax=1,
+            jt = todos_tempos.index(t)
+            im = ax.imshow(g["grades_m"][k, jt], cmap='Blues', vmin=0, vmax=1, interpolation='nearest')
+            ax.imshow(g["grades_infectado"][k, jt].astype(int), cmap=cmap_inf, vmin=0, vmax=1,
                       interpolation='nearest')
             ax.set_title(f"t = {int(t)}", fontsize=12)
             ax.set_xticks([])
@@ -452,11 +527,45 @@ def fig_grades(resumos, seed=0):
 
 
 # ---------------------------------------------------------------------------
+def figuras_por_condicao(resumos, gravar, escolhidas=None):
+    """Figuras 05 a 12, uma vez para cada condição inicial presente em ``resumos``."""
+    def quer(numero):
+        return not escolhidas or numero in escolhidas
+
+    for cond in ("C", "E"):
+        fam = por_condicao(resumos, cond)
+        if not fam:
+            print(f"[aviso] nenhum cenário com condição inicial {cond}; figuras 05 a 12 _{cond} não geradas")
+            continue
+        for banda in ("dp", "ep"):
+            fs = f"{banda}_{cond}.png"
+            if quer("05"):
+                gravar(anotar_condicao(fig_infectados(fam, "flu", banda), cond), f"05_flu_infectados_{fs}")
+            if quer("06"):
+                gravar(anotar_condicao(fig_infectados(fam, "measles", banda), cond), f"06_measles_infectados_{fs}")
+            if quer("07"):
+                gravar(anotar_condicao(fig_infectados(fam, "flu", banda, primeira=True), cond),
+                       f"07_flu_primeira_onda_{fs}")
+            if quer("08"):
+                gravar(anotar_condicao(fig_participacao(fam, banda), cond), f"08_participacao_vacinados_{fs}")
+            if quer("09"):
+                gravar(anotar_condicao(fig_taxas(fam, banda), cond), f"09_taxas_por_faixa_{fs}")
+            if quer("10"):
+                gravar(anotar_condicao(fig_faixas_reforcos(fam, banda), cond), f"10_flu_faixas_e_reforcos_{fs}")
+        if quer("11"):
+            gravar(anotar_condicao(fig_infeccoes_por_individuo(fam), cond),
+                   f"11_flu_infeccoes_por_individuo_{cond}.png")
+        if quer("12"):
+            gravar(anotar_condicao(fig_grades(fam), cond), f"12_grades_imunidade_{cond}.png")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Figuras do modelo de vacinação a partir de results/<código>.npz.")
     ap.add_argument("--resultados", default="results", help="pasta com os arquivos <código>.npz")
     ap.add_argument("--saida", default="analyses/plots", help="pasta das figuras")
     ap.add_argument("--dpi", type=int, default=300)
+    ap.add_argument("--figuras", nargs="+", default=None, metavar="NN",
+                    help="só as figuras com estes números (05 a 19); padrão: todas")
     a = ap.parse_args(argv)
 
     resumos = carregar(a.resultados)
@@ -471,7 +580,8 @@ def main(argv=None):
         quando = f", passo mediano de extinção {int(np.median(ext))}" if ext.size else ""
         print(f"{codigo}: {r['n_seeds']} seeds, horizonte {r['horizonte']}, primeiras doses em média "
               f"{float(r['doses1_total']['media']):.0f}, primeira onda até t = {r['onda'][1]}, "
-              f"{100 * r['extintas']:.0f}% das execuções extintas{quando}")
+              f"{100 * r['extintas']:.0f}% das execuções extintas{quando}, "
+              f"{100 * r['falho_seeds'].mean():.0f}% de surtos falhos")
 
     def gravar(fig, nome):
         if fig is None:
@@ -479,15 +589,10 @@ def main(argv=None):
         else:
             salvar(fig, a.saida, nome, a.dpi)
 
-    for banda in ("dp", "ep"):
-        gravar(fig_infectados(resumos, "flu", banda), f"05_flu_infectados_{banda}.png")
-        gravar(fig_infectados(resumos, "measles", banda), f"06_measles_infectados_{banda}.png")
-        gravar(fig_infectados(resumos, "flu", banda, primeira=True), f"07_flu_primeira_onda_{banda}.png")
-        gravar(fig_participacao(resumos, banda), f"08_participacao_vacinados_{banda}.png")
-        gravar(fig_taxas(resumos, banda), f"09_taxas_por_faixa_{banda}.png")
-        gravar(fig_faixas_reforcos(resumos, banda), f"10_flu_faixas_e_reforcos_{banda}.png")
-    gravar(fig_infeccoes_por_individuo(resumos), "11_flu_infeccoes_por_individuo.png")
-    gravar(fig_grades(resumos), "12_grades_imunidade.png")
+    figuras_por_condicao(resumos, gravar, a.figuras)
+    # figuras 13 a 19 (importado aqui porque o outro módulo usa as funções deste)
+    import figuras_complementares
+    figuras_complementares.todas(resumos, gravar, a.figuras)
     gravar_tabela(resumos, os.path.join(a.saida, "resumo_vacinacao.csv"))
     return 0
 

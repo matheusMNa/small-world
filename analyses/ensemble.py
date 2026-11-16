@@ -1,22 +1,33 @@
 """
 Roda o ensemble do modelo de vacinação e salva um arquivo .npz por pedaço.
 
-Um "pedaço" é um intervalo de seeds de um cenário. Cada pedaço vira um
+Um "pedaço" é um intervalo de seeds de uma configuração. Cada pedaço vira um
 arquivo ``<saida>/<código>_seeds<ini>-<fim>.npz``; pedaços que já existem são
 pulados, então um job interrompido pode ser simplesmente relançado. Depois de
 rodar tudo, ``analyses/juntar_pedacos.py`` reúne os pedaços em
 ``results/<código>.npz``.
+
+As 52 configurações estão em ``src.model_vacinacao.CONFIGURACOES``, em três grupos:
+
+* ``principal`` (30): os 15 cenários com 9 infectados iniciais em bloco central
+  (``F0C`` ... ``M6C``) e espalhados (``F0E`` ... ``M6E``);
+* ``semente`` (10): F0 e M0 com 1, 25 e 81 infectados iniciais (``F0C_I25``, ``F0E_I25``...);
+* ``conexoes`` (12): F0 e M0 com K = 0, 1 e 10 encontros de mercado (``F0C_K0``...).
 
 Exemplos, a partir da raiz do repositório::
 
     # tudo, em 8 processos, numa máquina só
     python analyses/ensemble.py --processos 8
 
-    # quantas tarefas (cenário, pedaço) existem com este tamanho de pedaço
-    python analyses/ensemble.py --tamanho-pedaco 50 --listar
+    # quantas tarefas (configuração, pedaço) existem com este tamanho de pedaço
+    python analyses/ensemble.py --tamanho-pedaco 500 --listar
 
     # uma única tarefa, como num job array do SLURM
-    python analyses/ensemble.py --tamanho-pedaco 50 --tarefa 17
+    python analyses/ensemble.py --tamanho-pedaco 500 --tarefa 17
+
+    # só um grupo, ou só algumas configurações
+    python analyses/ensemble.py --cenarios semente conexoes
+    python analyses/ensemble.py --cenarios F1C F1E
 
     # teste rápido: 3 seeds, 400 passos
     python analyses/ensemble.py --seed-fim 3 --horizonte 400 --saida /tmp/teste/pedacos
@@ -37,32 +48,40 @@ from concurrent.futures import ProcessPoolExecutor
 import numpy as np
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from src.model_vacinacao import CENARIOS, parametros_cenario, simular
+from src.model_vacinacao import CONFIGURACOES, GRUPOS, codigos_do_grupo, parametros_cenario, simular
 
 # Chaves com uma entrada por seed (primeiro eixo = seeds do pedaço).
-CHAVES_POR_SEED = ("n_inf_faixa", "n_naoinf_faixa", "novas_inf_faixa", "trans_faixa",
-                   "doses1", "reforcos", "imunidade_media", "hist_infeccoes",
-                   "t_extincao", "t_parada", "tempo_s")
+CHAVES_POR_SEED = ("n_inf_faixa", "n_naoinf_faixa", "novas_inf_faixa", "trans_faixa", "n_estado",
+                   "doses1", "reforcos", "imunidade_media", "hist_infeccoes", "doses1_em_recuperados",
+                   "t_extincao", "t_parada", "tempo_s",
+                   "perc_p", "perc_pinf", "perc_n_aglom", "perc_envolve", "perc_s_medio", "perc_hist")
 # Chaves das grades, guardadas só para as seeds de --seeds-grades.
-CHAVES_GRADES = ("grades_m", "grades_infectado")
+CHAVES_GRADES = ("grades_m", "grades_infectado", "grades_estado")
+SEEDS_GRADES = (0, 1, 2)
 
 
 def tempos_grades(horizonte):
-    """Passos em que as grades são guardadas: 0, 60, 300 e o horizonte."""
-    return sorted({t for t in (0, 60, 300, horizonte) if t <= horizonte})
+    """Passos em que as grades são guardadas e os aglomerados de suscetíveis são medidos.
+
+    0, 50, 100 e 150 repetem os instantes das figuras do modelo original; 10 é
+    logo depois de a vacinação em t = 0 fazer efeito; 60 é o instante da
+    vacinação reativa; 300, 600 e o horizonte mostram o longo prazo.
+    """
+    return sorted({t for t in (0, 10, 50, 60, 100, 150, 300, 600, horizonte) if t <= horizonte})
 
 
 def rodar_seed(args):
-    """Roda uma execução. O resultado depende só de (cenário, seed, horizonte)."""
+    """Roda uma execução. O resultado depende só de (configuração, seed, horizonte)."""
     codigo, seed, horizonte, guarda_grades = args
     p = parametros_cenario(codigo, horizonte=horizonte)
+    tempos = tempos_grades(horizonte)
     t0 = time.perf_counter()
-    res = simular(p, seed, snapshots=tempos_grades(horizonte) if guarda_grades else ())
+    res = simular(p, seed, snapshots=tempos if guarda_grades else (), percolacao=tempos)
     res["tempo_s"] = np.float32(time.perf_counter() - t0)
     return res
 
 
-def rodar_pedaco(codigo, seeds, horizonte, seeds_grades=(0,), executor=None):
+def rodar_pedaco(codigo, seeds, horizonte, seeds_grades=SEEDS_GRADES, executor=None):
     """Roda as ``seeds`` de um cenário e empilha os resultados em arrays.
 
     Com ``executor`` (um ProcessPoolExecutor), as seeds rodam em paralelo; o
@@ -82,6 +101,9 @@ def rodar_pedaco(codigo, seeds, horizonte, seeds_grades=(0,), executor=None):
                          else np.zeros((0, n_t, N, N), dtype=np.float32))
     dados["grades_infectado"] = (np.stack([resultados[i]["grades_infectado"] for i in com_grades])
                                  if com_grades else np.zeros((0, n_t, N, N), dtype=bool))
+    dados["grades_estado"] = (np.stack([resultados[i]["grades_estado"] for i in com_grades])
+                              if com_grades else np.zeros((0, n_t, N, N), dtype=np.int8))
+    dados["perc_tempos"] = np.array(tempos_grades(horizonte), dtype=np.int32)
     dados["seeds"] = np.array(seeds, dtype=np.int32)
     dados["codigo"] = np.array(codigo)
     dados["horizonte"] = np.int32(horizonte)
@@ -113,8 +135,25 @@ def pedaco_valido(caminho, seeds, horizonte):
         return False
 
 
+def expandir_cenarios(nomes):
+    """Troca 'todos' e os nomes de grupo pelos códigos; devolve (códigos, nomes desconhecidos)."""
+    codigos, desconhecidos = [], []
+    for nome in nomes:
+        if nome == "todos":
+            novos = list(CONFIGURACOES)
+        elif nome in GRUPOS:
+            novos = codigos_do_grupo(nome)
+        elif nome in CONFIGURACOES:
+            novos = [nome]
+        else:
+            desconhecidos.append(nome)
+            continue
+        codigos += [c for c in novos if c not in codigos]
+    return codigos, desconhecidos
+
+
 def lista_tarefas(cenarios, seed_inicio, seed_fim, tamanho_pedaco):
-    """Lista de (cenário, ini, fim) em ordem fixa; o índice é o da opção --tarefa."""
+    """Lista de (configuração, ini, fim) em ordem fixa; o índice é o da opção --tarefa."""
     tarefas = []
     for codigo in cenarios:
         for ini in range(seed_inicio, seed_fim, tamanho_pedaco):
@@ -125,7 +164,8 @@ def lista_tarefas(cenarios, seed_inicio, seed_fim, tamanho_pedaco):
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Ensemble do modelo de vacinação (um .npz por pedaço de seeds).")
     ap.add_argument("--cenarios", nargs="+", default=["todos"],
-                    help="códigos dos cenários (F0..F7, M0..M6) ou 'todos'")
+                    help="códigos das configurações (F1C, F1E, F0C_I25, M0E_K10...), nomes de grupo "
+                         "(principal, semente, conexoes) ou 'todos' (padrão)")
     ap.add_argument("--seed-inicio", type=int, default=0, help="primeira seed (padrão 0)")
     ap.add_argument("--seed-fim", type=int, default=500, help="seed final, exclusiva (padrão 500)")
     ap.add_argument("--tamanho-pedaco", type=int, default=50, help="seeds por arquivo (padrão 50)")
@@ -135,22 +175,21 @@ def main(argv=None):
     ap.add_argument("--tarefa", type=int, default=None,
                     help="roda só a tarefa com este índice (para job array); veja --listar")
     ap.add_argument("--listar", action="store_true", help="lista as tarefas e sai")
-    ap.add_argument("--seeds-grades", type=int, nargs="*", default=[0],
-                    help="seeds cujas grades de imunidade são guardadas (padrão: 0)")
+    ap.add_argument("--seeds-grades", type=int, nargs="*", default=list(SEEDS_GRADES),
+                    help="seeds cujas grades (imunidade, infectados, estados) são guardadas (padrão: 0 1 2)")
     ap.add_argument("--refazer", action="store_true", help="roda de novo pedaços que já existem")
     a = ap.parse_args(argv)
 
-    cenarios = list(CENARIOS) if a.cenarios == ["todos"] else a.cenarios
-    for c in cenarios:
-        if c not in CENARIOS:
-            ap.error(f"cenário desconhecido: {c}")
+    cenarios, desconhecidos = expandir_cenarios(a.cenarios)
+    if desconhecidos:
+        ap.error(f"configuração desconhecida: {', '.join(desconhecidos)}. Use --listar para ver os códigos.")
     if a.seed_fim <= a.seed_inicio or a.tamanho_pedaco < 1 or a.processos < 1:
         ap.error("intervalo de seeds, tamanho de pedaço ou número de processos inválido")
 
     tarefas = lista_tarefas(cenarios, a.seed_inicio, a.seed_fim, a.tamanho_pedaco)
     if a.listar:
         for i, (c, ini, fim) in enumerate(tarefas):
-            print(f"{i:4d}  {c}  seeds {ini}-{fim - 1}")
+            print(f"{i:4d}  {c:9s} {CONFIGURACOES[c]['grupo']:10s} seeds {ini}-{fim - 1}")
         print(f"{len(tarefas)} tarefas (índices 0 a {len(tarefas) - 1})")
         return 0
     if a.tarefa is not None:

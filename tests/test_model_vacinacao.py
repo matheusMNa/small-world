@@ -1,5 +1,6 @@
 """
-Testes do modelo de vacinação (seção 8 da especificação).
+Testes do modelo de vacinação (seção 8 da especificação) e das extensões
+posteriores: condição inicial espalhada, estados, percolação e configurações.
 
 Python puro, sem dependências além das do projeto. A partir da raiz::
 
@@ -20,9 +21,11 @@ from scipy.signal import convolve2d
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from analyses.ensemble import rodar_pedaco
 from src.model import simulate
-from src.model_vacinacao import (DESLOCAMENTOS, Simulacao, contribuicoes_locais, curva_dose,
-                                 indices_vizinhos, instante_pico, mascara_passos, parametros_cenario,
-                                 simular, taxas_por_faixa)
+from src.model_vacinacao import (CENARIOS, CONFIGURACOES, DESLOCAMENTOS, INFECTADO, RECUPERADO, SUSCETIVEL,
+                                 VACINADO, Simulacao, aglomerados_periodicos, codigos_do_grupo,
+                                 contribuicoes_locais, curva_dose, indices_vizinhos, instante_pico,
+                                 mascara_passos, medidas_percolacao, parametros_cenario, simular,
+                                 taxas_por_faixa)
 
 
 def test_01_contribuicoes_locais():
@@ -209,10 +212,7 @@ def test_10_reprodutibilidade():
         so1 = rodar_pedaco(codigo, [1], 200)
         for k in juntas:
             if k in ("tempo_s", "seeds", "codigo", "horizonte", "parametros_json",
-                     "grades_seeds", "grades_tempos"):
-                continue
-            if k.startswith("grades_"):   # só a seed 0 guarda grades
-                assert np.array_equal(juntas[k], so0[k]), (codigo, k)
+                     "grades_seeds", "grades_tempos", "perc_tempos"):
                 continue
             assert np.array_equal(juntas[k][0], so0[k][0]), (codigo, k)
             assert np.array_equal(juntas[k][1], so1[k][0]), (codigo, k)
@@ -223,10 +223,189 @@ def test_10_reprodutibilidade():
     assert np.array_equal(s_f.S0, s_m.S0) and np.array_equal(s_f.T0, s_m.T0)
 
 
+# Resumos de execuções feitas com a versão do modelo anterior às extensões
+# (três fluxos aleatórios, só bloco central): (infecções, I(100), I(horizonte),
+# primeiras doses, reforços, transmissões por vacinados, nunca infectados, passo de extinção).
+REFERENCIA_BLOCO_CENTRAL = {
+    ("F1", 3, 250): (5581, 74, 967, 4996, 8838, 1041, 5275, -1),
+    ("F6", 1, 250): (8753, 1065, 515, 5000, 5501, 1833, 3617, -1),
+    ("M2", 5, 250): (90, 5, 0, 4996, 0, 1, 9901, 244),
+    ("F4", 2, 200): (10475, 1339, 541, 3853, 2895, 1033, 2513, -1),
+    ("M5", 7, 300): (4572, 863, 0, 5000, 0, 11, 5419, 285),
+    ("F0", 0, 200): (16479, 2565, 946, 0, 0, 0, 228, -1),
+}
+
+
+def _resumo(r, h):
+    return (int(r["novas_inf_faixa"].sum()), int(r["n_inf_faixa"][100].sum()), int(r["n_inf_faixa"][h].sum()),
+            int(r["doses1"].sum()), int(r["reforcos"].sum()), int(r["trans_faixa"][:, 1:].sum()),
+            int(r["hist_infeccoes"][0]), int(r["t_extincao"]))
+
+
+def test_11_regressao_bloco_central():
+    """Com bloco central, os resultados são idênticos aos da versão anterior do modelo."""
+    for (codigo, seed, h), esperado in REFERENCIA_BLOCO_CENTRAL.items():
+        for cod in (codigo, codigo + "C"):       # "F1" e "F1C" são a mesma configuração
+            r = simular(parametros_cenario(cod, horizonte=h), seed)
+            assert _resumo(r, h) == esperado, (
+                f"{cod}, seed {seed}: {_resumo(r, h)} em vez de {esperado}. Se a versão do NumPy "
+                "mudou, os fluxos aleatórios podem ter mudado; compare com analyses/conferir_rodada_anterior.py")
+        # medir a percolação e guardar grades não altera a dinâmica
+        r = simular(parametros_cenario(codigo, horizonte=h), seed, snapshots=(0, 50), percolacao=(0, 10, 50, h))
+        assert _resumo(r, h) == esperado
+
+
+def test_12_infectados_espalhados():
+    """Condição E: 9 sítios sorteados, iguais entre cenários, diferentes entre seeds, mesma população de C."""
+    a = Simulacao(parametros_cenario("F1E"), 0)
+    b = Simulacao(parametros_cenario("M6E"), 0)
+    c = Simulacao(parametros_cenario("F1E"), 1)
+    central = Simulacao(parametros_cenario("F1C"), 0)
+    assert a.infectado.sum() == 9 and a.n_iniciais == 9
+    assert np.array_equal(a.infectado, b.infectado)            # mesma seed, cenários diferentes
+    assert not np.array_equal(a.infectado, c.infectado)        # seeds diferentes
+    assert np.array_equal(a.S0, central.S0) and np.array_equal(a.T0, central.T0)
+    # bloco central: quadrado 3 x 3 no meio da grade
+    g = central.infectado.reshape(100, 100)
+    assert g.sum() == 9 and g[49:52, 49:52].all()
+    # espalhados de verdade: em 200 seeds, os sítios sorteados cobrem a grade sem preferência pelo centro
+    linhas = np.concatenate([np.flatnonzero(Simulacao(parametros_cenario("F0E"), s).infectado) // 100
+                             for s in range(200)])
+    assert abs(linhas.mean() - 49.5) < 3 * 100 / np.sqrt(12 * linhas.size), linhas.mean()
+    # varredura da semente
+    for codigo, n in (("F0C_I1", 1), ("F0C_I25", 25), ("F0E_I25", 25), ("M0C_I81", 81), ("M0E_I81", 81)):
+        sim = Simulacao(parametros_cenario(codigo), 2)
+        assert sim.infectado.sum() == n, codigo
+    g = Simulacao(parametros_cenario("M0C_I81"), 2).infectado.reshape(100, 100)
+    assert g[46:55, 46:55].all()
+    # a dinâmica roda e conserva: toda infecção tem um transmissor
+    r = simular(parametros_cenario("F2E", horizonte=150), 4)
+    assert r["novas_inf_faixa"].sum() == r["trans_faixa"].sum() > 0
+
+
+def test_13_estados():
+    """Os quatro estados somam a população e batem com infectados, vacinados e recuperados."""
+    for codigo in ("F0C", "F1E", "F5C", "M0E", "M1C", "M6E"):
+        p = parametros_cenario(codigo, horizonte=300)
+        sim = Simulacao(p, 1)
+        r = sim.rodar(snapshots=(0, 10, 100, 300))
+        ne = r["n_estado"].astype(int)
+        assert (ne.sum(axis=1) == p.N ** 2).all(), codigo
+        assert np.array_equal(ne[:, INFECTADO], r["n_inf_faixa"].sum(axis=1)), codigo
+        for j, t in enumerate(r["grades_tempos"]):
+            g = r["grades_estado"][j]
+            assert np.array_equal(np.bincount(g.ravel(), minlength=4), ne[t]), (codigo, t)
+            assert np.array_equal(g == INFECTADO, r["grades_infectado"][j])
+            # suscetível = não infectado com m abaixo do limiar
+            assert np.array_equal(g == SUSCETIVEL, (r["grades_m"][j] < 0.5) & ~r["grades_infectado"][j])
+        if p.regime == "nenhum":
+            assert ne[:, VACINADO].sum() == 0, codigo
+        if codigo.startswith("M0"):
+            # SIR: recuperados = infecções acumuladas - infectados; suscetíveis não aumentam
+            acumuladas = 9 + np.concatenate([[0], np.cumsum(r["novas_inf_faixa"].sum(axis=1))[:-1]])
+            assert np.array_equal(ne[:, RECUPERADO], acumuladas - ne[:, INFECTADO])
+            assert (np.diff(ne[:, SUSCETIVEL]) <= 0).all()
+    # vacinação em t = 0 no Measles-like: em t = 10 metade dos sítios já está no estado vacinado
+    r = simular(parametros_cenario("M1C", horizonte=20), 0)
+    assert abs(int(r["n_estado"][10, VACINADO]) - 4996) <= 15
+    # primeiras doses em recuperados: nenhuma em t = 0, várias em t = 60
+    assert simular(parametros_cenario("F1C", horizonte=100), 0)["doses1_em_recuperados"] == 0
+    assert simular(parametros_cenario("F3C", horizonte=100), 0)["doses1_em_recuperados"] > 0
+
+
+def _aglomerados_forca_bruta(mask):
+    """Busca com coordenadas desdobradas: lista ordenada de (tamanho, envolve o toro)."""
+    N = mask.shape[0]
+    onde = {}
+    saida = []
+    for i0 in range(N):
+        for j0 in range(N):
+            if not mask[i0, j0] or (i0, j0) in onde:
+                continue
+            onde[(i0, j0)] = (i0, j0)
+            pilha, tam, env = [(i0, j0)], 0, False
+            while pilha:
+                i, j = pilha.pop()
+                ui, uj = onde[(i, j)]
+                tam += 1
+                for di, dj in DESLOCAMENTOS:
+                    viz = ((i + di) % N, (j + dj) % N)
+                    if not mask[viz]:
+                        continue
+                    if viz in onde:
+                        env = env or onde[viz] != (ui + di, uj + dj)
+                    else:
+                        onde[viz] = (ui + di, uj + dj)
+                        pilha.append(viz)
+            saida.append((tam, env))
+    return sorted(saida)
+
+
+def test_14_percolacao():
+    """Aglomerados periódicos com vizinhança de Moore: casos construídos e comparação com força bruta."""
+    N = 10
+    linha = np.zeros((N, N), bool); linha[3, :] = True
+    diagonal = np.zeros((N, N), bool); diagonal[np.arange(N), np.arange(N)] = True
+    canto = np.zeros((N, N), bool); canto[0, 0] = canto[0, N - 1] = canto[N - 1, 0] = True
+    bloco = np.zeros((N, N), bool); bloco[2:5, 2:5] = True
+    for mask, tam, env in ((linha, [10], [True]), (diagonal, [10], [True]), (canto, [3], [False]),
+                           (bloco, [9], [False]), (np.ones((N, N), bool), [100], [True]),
+                           (np.zeros((N, N), bool), [], [])):
+        _, t, e = aglomerados_periodicos(mask)
+        assert t.tolist() == tam and e.tolist() == env
+    rng = np.random.default_rng(1)
+    for N in (6, 13, 24):
+        for p in (0.2, 0.35, 0.41, 0.5, 0.7):
+            for _ in range(15):
+                mask = rng.random((N, N)) < p
+                rot, t, e = aglomerados_periodicos(mask)
+                assert sorted(zip(t.tolist(), e.tolist())) == _aglomerados_forca_bruta(mask), (N, p)
+                assert np.array_equal(rot > 0, mask) and t.sum() == mask.sum()
+    med = medidas_percolacao(bloco)
+    assert med["p"] == 0.09 and med["p_inf"] == 0.09 and med["n_aglom"] == 1 and not med["envolve"]
+    assert med["hist"].sum() == 1 and med["hist"][3] == 1          # tamanho 9 está em [8, 16)
+    # acima do limiar (0,407) o maior aglomerado envolve o toro; bem abaixo, não
+    alto = [medidas_percolacao(rng.random((100, 100)) < 0.55)["envolve"] for _ in range(10)]
+    baixo = [medidas_percolacao(rng.random((100, 100)) < 0.25)["envolve"] for _ in range(10)]
+    assert all(alto) and not any(baixo)
+    # dentro da simulação: em t = 0 quase todos são suscetíveis e o aglomerado envolve o toro
+    r = simular(parametros_cenario("M1C", horizonte=60), 0, percolacao=(0, 10, 60))
+    assert r["perc_tempos"].tolist() == [0, 10, 60]
+    assert r["perc_p"][0] > 0.99 and r["perc_envolve"][0]
+    assert abs(r["perc_p"][1] - 0.5) < 0.01                        # metade vacinada, já protegida em t = 10
+    assert np.isclose(r["perc_p"][2], r["n_estado"][60, SUSCETIVEL] / 1e4)
+
+
+def test_15_configuracoes():
+    """52 configurações: 30 principais, 10 de semente, 12 de conexões, com os parâmetros certos."""
+    assert len(CONFIGURACOES) == 52
+    assert len(codigos_do_grupo("principal")) == 30
+    assert len(codigos_do_grupo("semente")) == 10 and len(codigos_do_grupo("conexoes")) == 12
+    for base in CENARIOS:
+        pb, pc, pe = (parametros_cenario(base + x) for x in ("", "C", "E"))
+        assert pb == pc
+        assert pe.init_espalhados == 9 and pc.init_espalhados == 0 and pc.init_cluster == 3
+        # C e E só diferem na condição inicial
+        assert {k for k in pc.__dataclass_fields__ if getattr(pc, k) != getattr(pe, k)} == {"init_espalhados"}
+    for codigo, v in CONFIGURACOES.items():
+        p = parametros_cenario(codigo)
+        if v["grupo"] != "principal":
+            assert p.regime == "nenhum", codigo              # varreduras só sem vacina
+        if v["grupo"] == "conexoes":
+            assert p.K_encontros in (0, 1, 10) and (p.init_espalhados == 9 or p.init_cluster == 3)
+        else:
+            assert p.K_encontros == 3
+    assert parametros_cenario("M0E_K10").K_encontros == 10 and parametros_cenario("F0C_K0").K_encontros == 0
+    # K = 0 (só vizinhos) roda e atribui transmissores
+    r = simular(parametros_cenario("M0C_K0", horizonte=80), 0)
+    assert r["novas_inf_faixa"].sum() == r["trans_faixa"].sum() > 0
+
+
 TESTES = [test_01_contribuicoes_locais, test_02_equivalencia_com_modelo_atual, test_03_conservacao,
           test_04_curva_de_bateman, test_05_regra_de_reforco, test_06_doses_iguais,
           test_07_alocacao_gaussiana, test_08_faixa_protegida, test_09_measles_sem_reinfeccao,
-          test_10_reprodutibilidade]
+          test_10_reprodutibilidade, test_11_regressao_bloco_central, test_12_infectados_espalhados,
+          test_13_estados, test_14_percolacao, test_15_configuracoes]
 
 
 def main(argv):

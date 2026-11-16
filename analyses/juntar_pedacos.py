@@ -1,14 +1,15 @@
 """
-Reúne os pedaços gerados por ``analyses/ensemble.py`` em um arquivo por cenário.
+Reúne os pedaços gerados por ``analyses/ensemble.py`` em um arquivo por configuração.
 
-Para cada cenário, lê ``<pedacos>/<código>_seeds*.npz``, confere que as seeds
+Para cada configuração, lê ``<pedacos>/<código>_seeds*.npz``, confere que as seeds
 0 a n-1 estão todas presentes, sem repetição e com os mesmos parâmetros, e
 grava ``<saida>/<código>.npz``. Se faltar ou sobrar alguma seed, o cenário não
 é gravado e o script termina com erro, dizendo quais seeds são o problema.
 
 Exemplo, a partir da raiz do repositório::
 
-    python analyses/juntar_pedacos.py                      # 500 seeds, todos os cenários
+    python analyses/juntar_pedacos.py                      # 500 seeds, todas as configurações
+    python analyses/juntar_pedacos.py --cenarios principal # só um grupo
     python analyses/juntar_pedacos.py --n-seeds 3 --pedacos /tmp/teste/pedacos --saida /tmp/teste
 """
 import argparse
@@ -19,8 +20,7 @@ import sys
 import numpy as np
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from analyses.ensemble import CHAVES_GRADES, CHAVES_POR_SEED, salvar_npz
-from src.model_vacinacao import CENARIOS
+from analyses.ensemble import CHAVES_GRADES, CHAVES_POR_SEED, expandir_cenarios, salvar_npz
 
 
 def resumir(numeros, limite=12):
@@ -45,11 +45,16 @@ def juntar_cenario(codigo, pasta_pedacos, n_seeds):
         except Exception as e:
             raise ValueError(f"não foi possível ler {f}: {e}")
 
+    for f, parte in zip(arquivos, partes):
+        faltam = [k for k in CHAVES_POR_SEED + CHAVES_GRADES + ("perc_tempos",) if k not in parte]
+        if faltam:
+            raise ValueError(f"{f} é de uma versão anterior do ensemble (faltam {', '.join(faltam)})")
     ref = partes[0]
     for f, parte in zip(arquivos, partes):
         if str(parte["parametros_json"]) != str(ref["parametros_json"]):
             raise ValueError(f"{f} foi gerado com parâmetros diferentes dos de {arquivos[0]}")
-        if not np.array_equal(parte["grades_tempos"], ref["grades_tempos"]):
+        if not (np.array_equal(parte["grades_tempos"], ref["grades_tempos"])
+                and np.array_equal(parte["perc_tempos"], ref["perc_tempos"])):
             raise ValueError(f"{f} guarda grades em instantes diferentes dos de {arquivos[0]}")
 
     seeds = np.concatenate([parte["seeds"] for parte in partes])
@@ -76,7 +81,7 @@ def juntar_cenario(codigo, pasta_pedacos, n_seeds):
     dados["grades_seeds"] = seeds_g[ordem_g].astype(np.int32)
     for k in CHAVES_GRADES:
         dados[k] = np.concatenate([parte[k] for parte in partes])[ordem_g]
-    for k in ("grades_tempos", "codigo", "horizonte", "parametros_json"):
+    for k in ("grades_tempos", "perc_tempos", "codigo", "horizonte", "parametros_json"):
         dados[k] = ref[k]
     return dados
 
@@ -85,12 +90,15 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="Reúne os pedaços do ensemble em results/<código>.npz.")
     ap.add_argument("--pedacos", default="results/pedacos", help="pasta com os pedaços")
     ap.add_argument("--saida", default="results", help="pasta dos arquivos reunidos")
-    ap.add_argument("--cenarios", nargs="+", default=["todos"])
+    ap.add_argument("--cenarios", nargs="+", default=["todos"],
+                    help="códigos, nomes de grupo (principal, semente, conexoes) ou 'todos' (padrão)")
     ap.add_argument("--n-seeds", type=int, default=500,
                     help="número de seeds esperado; exige exatamente as seeds 0..n-1 (padrão 500)")
     a = ap.parse_args(argv)
 
-    cenarios = list(CENARIOS) if a.cenarios == ["todos"] else a.cenarios
+    cenarios, desconhecidos = expandir_cenarios(a.cenarios)
+    if desconhecidos:
+        ap.error(f"configuração desconhecida: {', '.join(desconhecidos)}")
     os.makedirs(a.saida, exist_ok=True)
     falhas = 0
     for codigo in cenarios:

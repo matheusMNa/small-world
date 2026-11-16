@@ -17,8 +17,13 @@ O que muda:
   dose e a parte natural decai exponencialmente depois da recuperação;
 * cada infecção é atribuída a um transmissor por riscos competitivos, o que
   permite contar infecções e transmissões por faixa de imunidade;
-* a semente aleatória é um parâmetro e gera três fluxos independentes
-  (atributos S0/T0, dinâmica, sorteio de vacinados).
+* a semente aleatória é um parâmetro e gera quatro fluxos independentes
+  (atributos S0/T0, dinâmica, sorteio de vacinados, posição dos infectados
+  iniciais espalhados);
+* os infectados iniciais ficam em um bloco central ou espalhados pela grade;
+* cada sítio é classificado em quatro estados (suscetível, infectado,
+  recuperado, vacinado), e os aglomerados de suscetíveis são medidos como em
+  um problema de percolação de sítios.
 
 Uso mínimo, a partir da raiz do repositório::
 
@@ -32,6 +37,7 @@ import json
 from dataclasses import asdict, dataclass
 
 import numpy as np
+from scipy import ndimage
 
 # ---------------------------------------------------------------------------
 # Faixas de status (seção 5 da especificação)
@@ -47,6 +53,22 @@ NOMES_FAIXAS = (
 # O histograma de infecções por indivíduo vai de 0 a MAX_HIST; a última
 # posição acumula "MAX_HIST ou mais".
 MAX_HIST = 40
+
+# Estados categóricos de um sítio (grades e série ``n_estado``):
+#   0 suscetível: não infectado e com imunidade m abaixo de ``limiar_suscetivel``;
+#   1 infectado;
+#   2 recuperado: não infectado, m acima do limiar e imunidade natural >= vacinal;
+#   3 vacinado:   não infectado, m acima do limiar e imunidade vacinal > natural.
+N_ESTADOS = 4
+NOMES_ESTADOS = ("Suscetível", "Infectado", "Recuperado", "Vacinado")
+SUSCETIVEL, INFECTADO, RECUPERADO, VACINADO = range(4)
+
+# Limiar de percolação de sítios na rede quadrada com vizinhança de Moore
+# (primeiros e segundos vizinhos). Essa rede é a rede "matching" da rede
+# quadrada, então p_c = 1 - p_c(quadrada) = 1 - 0,592746 (Sykes e Essam, 1964).
+P_C_MOORE = 0.407254
+# Histograma de tamanhos de aglomerado em classes [1, 2), [2, 4), [4, 8), ...
+N_CLASSES_AGLOM = 15
 
 # Deslocamentos (di, dj) dos 8 vizinhos de Moore, na ordem usada em todo o módulo.
 DESLOCAMENTOS = ((-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1))
@@ -67,6 +89,7 @@ class Parametros:
     W_mercado: float = 0.4       # peso de cada encontro de mercado
     K_encontros: int = 3         # encontros de mercado por indivíduo por passo
     init_cluster: int = 3        # lado do bloco central de infectados iniciais
+    init_espalhados: int = 0     # se > 0: este número de infectados iniciais em sítios sorteados (ignora o bloco)
     atrib_min: float = 0.2       # S0 e T0 ~ U(atrib_min, atrib_max)
     atrib_max: float = 1.0
     horizonte: int = 1500        # número de passos; as séries têm horizonte + 1 pontos
@@ -91,6 +114,7 @@ class Parametros:
 
     # --- métricas e execução ---
     limites_faixas: tuple = (0.5, 0.75, 0.9)
+    limiar_suscetivel: float = 0.5   # m abaixo disto (e sem infecção) = estado suscetível
     espera_parada: int = 30      # passos sem doses antes de permitir a parada antecipada
 
     def __post_init__(self):
@@ -100,6 +124,8 @@ class Parametros:
             raise ValueError(f"alocação desconhecida: {self.alocacao!r}")
         if not (self.tau_r < self.tau_d1 and self.tau_r < self.tau_d2):
             raise ValueError("a curva de Bateman exige tau_r < tau_d")
+        if self.init_espalhados < 0 or self.init_espalhados > self.N * self.N:
+            raise ValueError("init_espalhados deve estar entre 0 e N*N")
         if len(self.limites_faixas) != 3 or list(self.limites_faixas) != sorted(self.limites_faixas):
             raise ValueError("limites_faixas deve ter 3 valores crescentes")
 
@@ -139,17 +165,75 @@ CENARIOS = {
 }
 
 
-def parametros_cenario(codigo: str, **extras) -> Parametros:
-    """Parâmetros de um dos 15 cenários (``"F0"`` a ``"F7"``, ``"M0"`` a ``"M6"``).
+# Condição inicial: "C" = 9 infectados em um bloco 3 x 3 no centro da grade;
+# "E" = 9 infectados em sítios sorteados (espalhados).
+CONDICOES = {"C": "bloco central", "E": "espalhados"}
+N_INICIAIS = 9
+LADOS_SEMENTE = (1, 5, 9)        # varredura da semente: I0 = 1, 25 e 81 (I0 = 9 é o caso principal)
+K_VARREDURA = (0, 1, 10)         # varredura de encontros de mercado (K = 3 é o caso principal)
 
+
+def _montar_configuracoes() -> dict:
+    """Todas as configurações do ensemble, na ordem usada pelo job array.
+
+    Cada entrada tem ``base`` (um dos 15 cenários), ``grupo``, ``condicao``
+    ("C" ou "E") e ``extras`` (campos de Parametros que mudam em relação ao cenário).
+
+    * ``principal``: os 15 cenários nas duas condições iniciais (``F1C``, ``F1E``...);
+    * ``semente``: F0 e M0 com I0 = 1, 25 e 81 (``F0C_I25``, ``F0E_I25``...). Com
+      I0 = 1 só existe a versão C: um único infectado em uma grade periódica é
+      estatisticamente a mesma coisa no centro ou em um sítio sorteado;
+    * ``conexoes``: F0 e M0 com K = 0, 1 e 10 encontros de mercado (``F0C_K0``...).
+    """
+    conf = {}
+    for cond, extras in (("C", {}), ("E", {"init_espalhados": N_INICIAIS})):
+        for base in CENARIOS:
+            conf[f"{base}{cond}"] = dict(base=base, grupo="principal", condicao=cond, extras=dict(extras))
+    for base in ("F0", "M0"):
+        for lado in LADOS_SEMENTE:
+            n = lado * lado
+            conf[f"{base}C_I{n}"] = dict(base=base, grupo="semente", condicao="C",
+                                         extras=dict(init_cluster=lado))
+            if n > 1:
+                conf[f"{base}E_I{n}"] = dict(base=base, grupo="semente", condicao="E",
+                                             extras=dict(init_espalhados=n))
+    for base in ("F0", "M0"):
+        for K in K_VARREDURA:
+            for cond, extras in (("C", {}), ("E", {"init_espalhados": N_INICIAIS})):
+                conf[f"{base}{cond}_K{K}"] = dict(base=base, grupo="conexoes", condicao=cond,
+                                                  extras=dict(extras, K_encontros=K))
+    return conf
+
+
+CONFIGURACOES = _montar_configuracoes()
+GRUPOS = ("principal", "semente", "conexoes")
+
+
+def codigos_do_grupo(grupo: str) -> list:
+    """Códigos das configurações de um grupo, na ordem de ``CONFIGURACOES``."""
+    return [c for c, v in CONFIGURACOES.items() if v["grupo"] == grupo]
+
+
+def parametros_cenario(codigo: str, **extras) -> Parametros:
+    """Parâmetros de um cenário ou de uma configuração do ensemble.
+
+    Aceita os 15 códigos de cenário (``"F0"`` a ``"F7"``, ``"M0"`` a ``"M6"``; a
+    condição inicial é o bloco central, então ``"F1"`` equivale a ``"F1C"``) e
+    os códigos de ``CONFIGURACOES`` (``"F1E"``, ``"F0C_I25"``, ``"M0E_K10"``...).
     ``extras`` sobrescreve qualquer campo, por exemplo ``horizonte=400``.
     """
-    if codigo not in CENARIOS:
-        raise KeyError(f"cenário desconhecido: {codigo!r}; opções: {', '.join(CENARIOS)}")
-    campos = dict(CENARIOS[codigo])
+    if codigo in CENARIOS:
+        base_cod, extras_conf = codigo, {}
+    elif codigo in CONFIGURACOES:
+        base_cod, extras_conf = CONFIGURACOES[codigo]["base"], CONFIGURACOES[codigo]["extras"]
+    else:
+        raise KeyError(f"cenário desconhecido: {codigo!r}; opções: {', '.join(CENARIOS)} "
+                       f"ou as configurações {', '.join(CONFIGURACOES)}")
+    campos = dict(CENARIOS[base_cod])
     doenca = campos.pop("doenca")
     base = dict(DOENCAS[doenca])
     base.update(campos)
+    base.update(extras_conf)
     base.update(extras)
     return Parametros(**base)
 
@@ -204,6 +288,105 @@ def indices_vizinhos(N: int) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# Aglomerados de suscetíveis (percolação de sítios, vizinhança de Moore)
+# ---------------------------------------------------------------------------
+_MOORE = np.ones((3, 3), dtype=int)
+
+
+def aglomerados_periodicos(mask: np.ndarray):
+    """Aglomerados de ``mask`` (N x N, booleano) com vizinhança de Moore e contorno periódico.
+
+    Devolve ``(rotulos, tamanhos, envolve)``: ``rotulos`` é um array N x N com 0
+    fora da máscara e 1..n em cada aglomerado; ``tamanhos[k - 1]`` é o número de
+    sítios do aglomerado k; ``envolve[k - 1]`` diz se ele dá a volta no toro
+    (existe um caminho fechado dentro dele que não pode ser contraído a um ponto).
+
+    Método: rotula com contorno aberto e depois une os rótulos pelas ligações
+    que atravessam as bordas. Cada ligação carrega o deslocamento (em número de
+    voltas) entre as duas cópias periódicas; um aglomerado envolve o toro quando
+    duas ligações o fecham com deslocamentos incompatíveis (união com pesos).
+    """
+    mask = np.asarray(mask, dtype=bool)
+    N = mask.shape[0]
+    rot, n = ndimage.label(mask, structure=_MOORE)
+    if n == 0:
+        return rot, np.zeros(0, dtype=np.int64), np.zeros(0, dtype=bool)
+
+    # Ligações que cruzam a borda: (a, b, wi, wj) com cópia(b) = cópia(a) + (wi, wj).
+    idx = np.arange(N)
+    lig = []
+    for d in (-1, 0, 1):
+        k2 = idx + d
+        w = np.floor_divide(k2, N)          # -1, 0 ou +1: volta na outra direção (cantos)
+        k2 = k2 % N
+        um = np.ones(N, dtype=np.int64)
+        lig.append(np.stack([rot[idx, N - 1], rot[k2, 0], w, um], axis=1))    # cruza a última coluna
+        lig.append(np.stack([rot[N - 1, idx], rot[0, k2], um, w], axis=1))    # cruza a última linha
+    lig = np.concatenate(lig)
+    lig = np.unique(lig[(lig[:, 0] > 0) & (lig[:, 1] > 0)], axis=0)
+
+    pai = list(range(n + 1))
+    des = [(0, 0)] * (n + 1)       # cópia(nó) - cópia(pai do nó)
+    volta = [False] * (n + 1)      # válido nas raízes
+
+    def achar(a):
+        caminho = []
+        while pai[a] != a:
+            caminho.append(a)
+            a = pai[a]
+        ai = aj = 0
+        for x in reversed(caminho):           # compressão de caminho, acumulando deslocamentos
+            ai, aj = ai + des[x][0], aj + des[x][1]
+            pai[x], des[x] = a, (ai, aj)
+        return a
+
+    for a, b, wi, wj in lig.tolist():
+        ra, rb = achar(a), achar(b)
+        oa = des[a] if a != ra else (0, 0)
+        ob = des[b] if b != rb else (0, 0)
+        if ra == rb:
+            if (ob[0] - oa[0], ob[1] - oa[1]) != (wi, wj):
+                volta[ra] = True
+        else:
+            pai[rb] = ra
+            des[rb] = (wi + oa[0] - ob[0], wj + oa[1] - ob[1])
+            volta[ra] = volta[ra] or volta[rb]
+
+    raiz = np.array([0] + [achar(k) for k in range(1, n + 1)])
+    raizes, novo = np.unique(raiz[1:], return_inverse=True)
+    mapa = np.concatenate([[0], novo + 1])
+    rotulos = mapa[rot]
+    tamanhos = np.bincount(rotulos.ravel(), minlength=raizes.size + 1)[1:]
+    envolve = np.array([volta[r] for r in raizes], dtype=bool)
+    return rotulos, tamanhos, envolve
+
+
+def medidas_percolacao(mask: np.ndarray) -> dict:
+    """Medidas de percolação dos sítios de ``mask`` (os suscetíveis).
+
+    * ``p``: fração de sítios na máscara (parâmetro de controle);
+    * ``p_inf``: fração de todos os sítios que está no maior aglomerado (parâmetro de ordem);
+    * ``n_aglom``: número de aglomerados;
+    * ``envolve``: o maior aglomerado dá a volta no toro (critério de percolação em rede finita);
+    * ``s_medio``: tamanho médio dos aglomerados finitos, sum(s^2) / sum(s) sem o maior
+      (análogo da suscetibilidade; tem máximo perto do limiar);
+    * ``hist``: número de aglomerados com tamanho em [1, 2), [2, 4), [4, 8), ...
+    """
+    mask = np.asarray(mask, dtype=bool)
+    _, tam, env = aglomerados_periodicos(mask)
+    hist = np.zeros(N_CLASSES_AGLOM, dtype=np.int32)
+    if tam.size == 0:
+        return dict(p=0.0, p_inf=0.0, n_aglom=0, envolve=False, s_medio=0.0, hist=hist)
+    classes = np.minimum(np.floor(np.log2(tam)).astype(int), N_CLASSES_AGLOM - 1)
+    hist += np.bincount(classes, minlength=N_CLASSES_AGLOM).astype(np.int32)
+    maior = int(np.argmax(tam))
+    resto = np.delete(tam, maior).astype(float)
+    s_medio = float((resto ** 2).sum() / resto.sum()) if resto.size else 0.0
+    return dict(p=float(mask.mean()), p_inf=float(tam[maior] / mask.size), n_aglom=int(tam.size),
+                envolve=bool(env[maior]), s_medio=s_medio, hist=hist)
+
+
+# ---------------------------------------------------------------------------
 # Simulação
 # ---------------------------------------------------------------------------
 class Simulacao:
@@ -218,10 +401,13 @@ class Simulacao:
         self.seed = int(seed)
         N2 = p.N * p.N
 
-        # Três fluxos independentes derivados da seed: atributos, dinâmica, vacinação.
-        # A seed k produz os mesmos S0 e T0 em todos os cenários, e a dinâmica
-        # não consome números do fluxo de vacinação (comparações pareadas).
-        ss_attr, ss_din, ss_vac = np.random.SeedSequence(self.seed).spawn(3)
+        # Quatro fluxos independentes derivados da seed: atributos, dinâmica,
+        # vacinação e posição dos infectados iniciais espalhados. A seed k
+        # produz os mesmos S0 e T0 em todos os cenários, e a dinâmica não
+        # consome números do fluxo de vacinação (comparações pareadas). Os três
+        # primeiros fluxos são os mesmos de quando só havia três: spawn(4)
+        # começa pelos mesmos filhos de spawn(3).
+        ss_attr, ss_din, ss_vac, ss_ini = np.random.SeedSequence(self.seed).spawn(4)
         rng_attr = np.random.default_rng(ss_attr)
         self.rng_din = np.random.default_rng(ss_din)
         self.rng_vac = np.random.default_rng(ss_vac)
@@ -242,13 +428,20 @@ class Simulacao:
         self.t_cruzou = np.full(N2, np.nan)     # instante em que m cruzou o limiar descendo
         self.n_infec = np.zeros(N2, dtype=np.int32)  # infecções sofridas por cada indivíduo
 
-        # Infectados iniciais: bloco central, como em src/model.py.
+        # Infectados iniciais, como em src/model.py: sítios sorteados sem
+        # reposição (init_espalhados > 0) ou um bloco central.
         grade = self.infectado.reshape(p.N, p.N)
-        c, r = p.N // 2, p.init_cluster // 2
-        if p.init_cluster == 1:
-            grade[c, c] = True
+        if p.init_espalhados > 0:
+            # As posições dependem só da seed e do número de infectados: a seed k
+            # tem os mesmos infectados iniciais em todos os cenários.
+            sorteados = np.random.default_rng(ss_ini).choice(N2, size=p.init_espalhados, replace=False)
+            self.infectado[sorteados] = True
         else:
-            grade[c - r:c + r + 1, c - r:c + r + 1] = True
+            c, r = p.N // 2, p.init_cluster // 2
+            if p.init_cluster == 1:
+                grade[c, c] = True
+            else:
+                grade[c - r:c + r + 1, c - r:c + r + 1] = True
         self.n_infec[self.infectado] = 1
         self.n_iniciais = int(self.infectado.sum())
 
@@ -264,6 +457,7 @@ class Simulacao:
         # Controle da primeira dose.
         self._total_continuo = int(np.floor(p.cobertura * N2 + 0.5))
         self._doses1_aplicadas = 0
+        self.doses1_em_recuperados = 0   # primeiras doses dadas a quem já teve a doença
         self._inst_aplicada = False
         self._t_ultima_dose = -np.inf
 
@@ -280,6 +474,8 @@ class Simulacao:
         self.doses1 = np.zeros(T1, dtype=np.int32)
         self.reforcos = np.zeros(T1, dtype=np.int32)
         self.imunidade_media = np.zeros(T1, dtype=np.float32)
+        # sítios em cada estado (suscetível, infectado, recuperado, vacinado)
+        self.n_estado = np.zeros((T1, N_ESTADOS), dtype=np.int16 if N2 <= 32767 else np.int32)
         self.t_extincao = -1   # primeiro passo sem infectados (-1 = nunca)
         self.t_parada = p.horizonte  # último passo efetivamente simulado
         self.auditoria_reforcos = []  # preenchida só com auditoria=True
@@ -315,6 +511,12 @@ class Simulacao:
         """Faixa de status (0 a 4) de cada sítio, dada a imunidade ``m``."""
         nivel = np.digitize(m, self.p.limites_faixas)   # 0: m < 0,50 ... 3: m >= 0,90
         return np.where(self.n_doses > 0, 4 - nivel, 0)
+
+    def estados(self, m: np.ndarray, m_vac: np.ndarray, m_nat: np.ndarray) -> np.ndarray:
+        """Estado categórico (0 a 3) de cada sítio; veja ``NOMES_ESTADOS``."""
+        imune = np.where(m_nat >= m_vac, RECUPERADO, VACINADO)
+        estado = np.where(m < self.p.limiar_suscetivel, SUSCETIVEL, imune)
+        return np.where(self.infectado, INFECTADO, estado).astype(np.int8)
 
     # ----- vacinação ---------------------------------------------------------
     def _sortear_primeira_dose(self, elegiveis: np.ndarray, n: int) -> np.ndarray:
@@ -355,13 +557,17 @@ class Simulacao:
         if p.regime == "instantaneo" and t == p.t_vac:
             elegiveis = np.flatnonzero((self.n_doses == 0) & ~self.infectado)
             n1 = int(np.floor(p.cobertura * elegiveis.size + 0.5))
-            self._aplicar_dose(self._sortear_primeira_dose(elegiveis, n1), t)
+            ids1 = self._sortear_primeira_dose(elegiveis, n1)
+            self.doses1_em_recuperados += int((~np.isnan(self.t_rec[ids1])).sum())
+            self._aplicar_dose(ids1, t)
             self._inst_aplicada = True
         elif p.regime == "continuo" and t >= p.t_vac and self._doses1_aplicadas < self._total_continuo:
             elegiveis = np.flatnonzero((self.n_doses == 0) & ~self.infectado)
             n1 = min(p.doses_por_passo, self._total_continuo - self._doses1_aplicadas, elegiveis.size)
             if n1 > 0:
-                self._aplicar_dose(self._sortear_primeira_dose(elegiveis, n1), t)
+                ids1 = self._sortear_primeira_dose(elegiveis, n1)
+                self.doses1_em_recuperados += int((~np.isnan(self.t_rec[ids1])).sum())
+                self._aplicar_dose(ids1, t)
         self._doses1_aplicadas += n1
 
         nref = 0
@@ -436,35 +642,46 @@ class Simulacao:
         self.n_infec[novos] += 1
 
     # ----- laço principal ----------------------------------------------------
-    def rodar(self, snapshots=(), auditoria: bool = False) -> dict:
+    def rodar(self, snapshots=(), percolacao=(), auditoria: bool = False) -> dict:
         """Roda até o horizonte e devolve as séries e os totais.
 
-        ``snapshots``: passos em que as grades de ``m`` e de infectados são guardadas.
+        ``snapshots``: passos em que as grades de ``m``, de infectados e de estados são guardadas.
+        ``percolacao``: passos em que os aglomerados de suscetíveis são medidos.
         ``auditoria``: guarda, para cada reforço, o tempo desde a dose anterior,
         a imunidade e o estado de infecção (usado nos testes).
         """
         p = self.p
         N = p.N
         snapshots = sorted(set(int(s) for s in snapshots if 0 <= int(s) <= p.horizonte))
-        grades_m, grades_inf = {}, {}
+        percolacao = sorted(set(int(s) for s in percolacao if 0 <= int(s) <= p.horizonte))
+        grades_m, grades_inf, grades_est, perc = {}, {}, {}, {}
+
+        def registrar(s, m, estado):
+            """Guarda as grades e as medidas de percolação do passo ``s``."""
+            if s in snapshots:
+                grades_m[s] = m.reshape(N, N).astype(np.float32)
+                grades_inf[s] = self.infectado.reshape(N, N).copy()
+                grades_est[s] = estado.reshape(N, N).copy()
+            if s in percolacao:
+                perc[s] = medidas_percolacao((estado == SUSCETIVEL).reshape(N, N))
 
         for t in range(p.horizonte + 1):
-            m, _, _ = self.imunidade(t)
+            m, m_vac, m_nat = self.imunidade(t)
             n1, nref = self._vacinar(t, m, auditoria)
             faixa = self.faixas(m)   # depois da vacinação: quem tomou dose agora já conta como vacinado
+            estado = self.estados(m, m_vac, m_nat)
 
             inf = self.infectado
             self.n_inf_faixa[t] = np.bincount(faixa[inf], minlength=N_FAIXAS)
             self.n_naoinf_faixa[t] = np.bincount(faixa[~inf], minlength=N_FAIXAS)
+            self.n_estado[t] = np.bincount(estado, minlength=N_ESTADOS)
             self.doses1[t] = n1
             self.reforcos[t] = nref
             self.imunidade_media[t] = m.mean()
             n_infectados = int(self.n_inf_faixa[t].sum())
             if n_infectados == 0 and self.t_extincao < 0:
                 self.t_extincao = t
-            if t in snapshots:
-                grades_m[t] = m.reshape(N, N).astype(np.float32)
-                grades_inf[t] = inf.reshape(N, N).copy()
+            registrar(t, m, estado)
 
             if t == p.horizonte:
                 break
@@ -477,26 +694,30 @@ class Simulacao:
                     self.n_inf_faixa[t + 1:] = self.n_inf_faixa[t]
                     self.n_naoinf_faixa[t + 1:] = self.n_naoinf_faixa[t]
                     self.imunidade_media[t + 1:] = self.imunidade_media[t]
+                    self.n_estado[t + 1:] = self.n_estado[t]
                     self.t_parada = t
-                    for s in snapshots:
+                    for s in sorted(set(snapshots) | set(percolacao)):
                         if s > t:
-                            grades_m[s] = self.imunidade(s)[0].reshape(N, N).astype(np.float32)
-                            grades_inf[s] = inf.reshape(N, N).copy()
+                            ms, mv, mn = self.imunidade(s)
+                            registrar(s, ms, self.estados(ms, mv, mn))
                     break
                 continue
 
             self._dinamica(t, m, faixa)
 
+        n_perc = len(percolacao)
         return dict(
             n_inf_faixa=self.n_inf_faixa,
             n_naoinf_faixa=self.n_naoinf_faixa,
             novas_inf_faixa=self.novas_inf_faixa,
             trans_faixa=self.trans_faixa,
+            n_estado=self.n_estado,
             doses1=self.doses1,
             reforcos=self.reforcos,
             imunidade_media=self.imunidade_media,
             hist_infeccoes=np.bincount(np.minimum(self.n_infec, MAX_HIST),
                                        minlength=MAX_HIST + 1).astype(np.int32),
+            doses1_em_recuperados=np.int32(self.doses1_em_recuperados),
             t_extincao=np.int32(self.t_extincao),
             t_parada=np.int32(self.t_parada),
             grades_tempos=np.array(snapshots, dtype=np.int32),
@@ -504,10 +725,20 @@ class Simulacao:
                       else np.zeros((0, N, N), dtype=np.float32)),
             grades_infectado=(np.stack([grades_inf[s] for s in snapshots]) if snapshots
                               else np.zeros((0, N, N), dtype=bool)),
+            grades_estado=(np.stack([grades_est[s] for s in snapshots]) if snapshots
+                           else np.zeros((0, N, N), dtype=np.int8)),
+            perc_tempos=np.array(percolacao, dtype=np.int32),
+            perc_p=np.array([perc[s]["p"] for s in percolacao], dtype=np.float32),
+            perc_pinf=np.array([perc[s]["p_inf"] for s in percolacao], dtype=np.float32),
+            perc_n_aglom=np.array([perc[s]["n_aglom"] for s in percolacao], dtype=np.int32),
+            perc_envolve=np.array([perc[s]["envolve"] for s in percolacao], dtype=bool),
+            perc_s_medio=np.array([perc[s]["s_medio"] for s in percolacao], dtype=np.float32),
+            perc_hist=(np.stack([perc[s]["hist"] for s in percolacao]) if n_perc
+                       else np.zeros((0, N_CLASSES_AGLOM), dtype=np.int32)),
         )
 
 
-def simular(p: Parametros, seed: int, snapshots=(), auditoria: bool = False) -> dict:
+def simular(p: Parametros, seed: int, snapshots=(), percolacao=(), auditoria: bool = False) -> dict:
     """Roda uma realização e devolve um dicionário de arrays.
 
     Séries, com ``horizonte + 1`` pontos (o índice é o passo):
@@ -515,14 +746,21 @@ def simular(p: Parametros, seed: int, snapshots=(), auditoria: bool = False) -> 
     * ``n_inf_faixa``, ``n_naoinf_faixa`` (T+1, 5): infectados e não infectados em cada faixa;
     * ``novas_inf_faixa`` (T+1, 5): infecções ocorridas no passo, pela faixa de quem se infectou;
     * ``trans_faixa`` (T+1, 5): as mesmas infecções, pela faixa de quem transmitiu;
+    * ``n_estado`` (T+1, 4): sítios suscetíveis, infectados, recuperados e vacinados;
     * ``doses1``, ``reforcos`` (T+1): doses aplicadas no passo;
     * ``imunidade_media`` (T+1): média de ``m`` na população.
 
     Totais: ``hist_infeccoes`` (número de indivíduos com 0, 1, ..., MAX_HIST ou
-    mais infecções; os infectados iniciais contam), ``t_extincao`` (primeiro
-    passo sem infectados, -1 se nunca) e ``t_parada``.
+    mais infecções; os infectados iniciais contam), ``doses1_em_recuperados``
+    (primeiras doses dadas a quem já tinha se recuperado de uma infecção),
+    ``t_extincao`` (primeiro passo sem infectados, -1 se nunca) e ``t_parada``.
+
+    Com ``snapshots``: ``grades_m``, ``grades_infectado`` e ``grades_estado`` nos
+    passos de ``grades_tempos``. Com ``percolacao``: ``perc_p``, ``perc_pinf``,
+    ``perc_n_aglom``, ``perc_envolve``, ``perc_s_medio`` e ``perc_hist`` nos passos
+    de ``perc_tempos`` (veja :func:`medidas_percolacao`).
     """
-    return Simulacao(p, seed).rodar(snapshots=snapshots, auditoria=auditoria)
+    return Simulacao(p, seed).rodar(snapshots=snapshots, percolacao=percolacao, auditoria=auditoria)
 
 
 # ---------------------------------------------------------------------------

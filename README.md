@@ -83,24 +83,52 @@ Cada infecção é atribuída a um transmissor por riscos competitivos: dado que
 | F6, M6 | Flu-like, Measles-like | contínua | gaussiana | só no Flu-like |
 | F7 | Flu-like | $t = 0$ | aleatória | não (controle) |
 
-O ensemble usa as seeds 0 a 499 em cada cenário e 1500 passos. A seed define os atributos $S^0$ e $T^0$, a dinâmica e o sorteio de vacinados por três fluxos aleatórios independentes, de modo que a seed $k$ produz a mesma população em todos os cenários.
+O ensemble usa as seeds 0 a 499 em cada configuração e 1500 passos. A seed define os atributos $S^0$ e $T^0$, a dinâmica, o sorteio de vacinados e a posição dos infectados iniciais espalhados por quatro fluxos aleatórios independentes, de modo que a seed $k$ produz a mesma população em todas as configurações.
+
+## Configurações do ensemble
+
+Cada cenário é simulado com duas condições iniciais, indicadas por um sufixo no código: `C`, com 9 infectados em um bloco $3 \times 3$ no centro da grade, e `E`, com 9 infectados em sítios sorteados. São 52 configurações, em três grupos:
+
+| Grupo | Configurações | Códigos |
+|---|---|---|
+| `principal` | os 15 cenários nas duas condições iniciais (30) | `F0C` ... `M6C`, `F0E` ... `M6E` |
+| `semente` | `F0` e `M0` com 1, 25 e 81 infectados iniciais (10) | `F0C_I1`, `F0C_I25`, `F0E_I25`, ... |
+| `conexoes` | `F0` e `M0` com $K = 0$, 1 e 10 encontros de mercado por passo (12) | `F0C_K0`, `F0E_K0`, ..., `M0E_K10` |
+
+Em cada execução, cada sítio é classificado em quatro estados: suscetível (não infectado, com $m < 0{,}5$), infectado, recuperado ($m \ge 0{,}5$ com imunidade natural maior ou igual à vacinal) e vacinado ($m \ge 0{,}5$ com imunidade vacinal maior). Em nove instantes ($t = 0$, 10, 50, 60, 100, 150, 300, 600 e 1500), os aglomerados de suscetíveis são medidos como em um problema de percolação de sítios, com vizinhança de Moore e contorno periódico: fração de suscetíveis $p$, fração dos sítios no maior aglomerado $P_\infty$, número de aglomerados, se o maior aglomerado dá a volta no toro e a distribuição de tamanhos. Nessa rede, o limiar de percolação de sítios é $p_c = 1 - 0{,}592746 \approx 0{,}407$. As grades completas são guardadas para as seeds 0, 1 e 2.
 
 ## Arquivos
 
 | Arquivo | Conteúdo |
 |---|---|
-| `src/model_vacinacao.py` | Modelo, definição dos 15 cenários e métricas derivadas |
-| `analyses/ensemble.py` | Roda os cenários e grava um `.npz` por pedaço de seeds em `results/pedacos/` |
+| `src/model_vacinacao.py` | Modelo, definição dos cenários e das 52 configurações, percolação e métricas derivadas |
+| `analyses/ensemble.py` | Roda as configurações e grava um `.npz` por pedaço de seeds em `results/pedacos/` |
 | `analyses/juntar_pedacos.py` | Confere as seeds e reúne os pedaços em `results/<código>.npz` |
-| `analyses/figuras_vacinacao.py` | Gera as figuras `05` a `12` e a tabela `resumo_vacinacao.csv` em `analyses/plots/` a partir de `results/`, sem simular |
-| `cluster/ensemble_array.slurm` | Job array do SLURM, com campos a preencher (não testado em cluster) |
+| `analyses/figuras_vacinacao.py` | Gera as figuras `05` a `19` e a tabela `resumo_vacinacao.csv` em `analyses/plots/` a partir de `results/`, sem simular |
+| `analyses/figuras_complementares.py` | Funções das figuras `13` a `19`, chamadas pelo script acima |
+| `analyses/figuras_vacinacao.ipynb` | Notebook que desenha as mesmas figuras na tela, para conferir e ajustar |
+| `analyses/conferir_rodada_anterior.py` | Confere que os resultados com bloco central reproduzem os de uma rodada anterior |
+| `cluster/ensemble_array.slurm` | Job array do SLURM (partição, memória, tempo e ambiente dependem do cluster) |
 | `tests/test_model_vacinacao.py` | Testes do modelo |
+
+## Figuras
+
+| Figura | Conteúdo |
+|---|---|
+| `05` a `12` | Infectados no tempo, primeira onda, participação dos vacinados, taxas por faixa de imunidade, faixas e reforços, infecções por indivíduo e mapas de imunidade. Uma versão por condição inicial (`_C` e `_E`) |
+| `13` | Evolução espacial em quatro estados, para todos os cenários |
+| `14` | Ensemble sem vacina contra as EDOs de campo médio (SIR no Measles-like, SIRS no Flu-like) |
+| `15` | Efeito da semente inicial: número de infectados iniciais, em bloco ou espalhados |
+| `16` | Efeito das conexões globais: $K$ encontros de mercado por passo |
+| `17` | Vacinação preventiva ($t = 0$), reativa ($t = 60$) e contínua em um só painel |
+| `18` | Percolação dos suscetíveis: parâmetro de ordem e mapas de aglomerados |
+| `19` | Comparação entre infectados iniciais em bloco central e espalhados |
 
 ## Como rodar
 
 Todos os comandos são executados a partir da raiz do repositório, no mesmo ambiente Conda.
 
-1. Testes (cerca de meio minuto):
+1. Testes (menos de um minuto):
 
    ```bash
    python tests/test_model_vacinacao.py
@@ -109,7 +137,7 @@ Todos os comandos são executados a partir da raiz do repositório, no mesmo amb
 2. Verificação rápida do fluxo completo, com 3 seeds e 400 passos, em uma pasta temporária:
 
    ```bash
-   python analyses/ensemble.py --seed-fim 3 --horizonte 400 --saida /tmp/teste/pedacos
+   python analyses/ensemble.py --seed-fim 3 --tamanho-pedaco 3 --horizonte 400 --saida /tmp/teste/pedacos
    python analyses/juntar_pedacos.py --n-seeds 3 --pedacos /tmp/teste/pedacos --saida /tmp/teste
    python analyses/figuras_vacinacao.py --resultados /tmp/teste --saida /tmp/teste/plots --dpi 80
    ```
@@ -120,14 +148,14 @@ Todos os comandos são executados a partir da raiz do repositório, no mesmo amb
    python analyses/ensemble.py --processos 8
    ```
 
-   Ou em um cluster com SLURM, depois de preencher partição, memória, tempo e ambiente em `cluster/ensemble_array.slurm`:
+   Ou em um cluster com SLURM, depois de conferir partição, memória, tempo e ambiente em `cluster/ensemble_array.slurm`:
 
    ```bash
    mkdir -p logs results/pedacos
    sbatch cluster/ensemble_array.slurm
    ```
 
-   Nos dois casos, pedaços já gravados são pulados, então basta relançar o mesmo comando para retomar uma execução interrompida.
+   Nos dois casos, pedaços já gravados são pulados, então basta relançar o mesmo comando para retomar uma execução interrompida. A opção `--cenarios` aceita códigos (`F1C F1E`), nomes de grupo (`principal`, `semente`, `conexoes`) ou `todos`; `python analyses/ensemble.py --tamanho-pedaco 500 --listar` mostra o índice de cada tarefa do job array.
 
 4. Junção e figuras:
 
@@ -136,14 +164,16 @@ Todos os comandos são executados a partir da raiz do repositório, no mesmo amb
    python analyses/figuras_vacinacao.py
    ```
 
-   A junção falha, dizendo quais seeds faltam ou se repetem, se algum cenário não tiver exatamente as seeds 0 a 499. Cada figura com banda de erro sai em duas versões: `_dp` (desvio padrão entre seeds) e `_ep` (erro padrão da média).
+   A junção falha, dizendo quais seeds faltam ou se repetem, se alguma configuração não tiver exatamente as seeds 0 a 499. Cada figura com banda de erro sai em duas versões: `_dp` (desvio padrão entre seeds) e `_ep` (erro padrão da média). Para gerar só algumas figuras, use `--figuras`, por exemplo `python analyses/figuras_vacinacao.py --figuras 17 18`.
+
+5. Para ver e ajustar as figuras na tela, abra `analyses/figuras_vacinacao.ipynb` no Jupyter, com os arquivos `results/<código>.npz` na máquina local.
 
 Para usar o modelo diretamente:
 
 ```python
 from src.model_vacinacao import parametros_cenario, simular
 
-res = simular(parametros_cenario("F1", horizonte=400), seed=0)
+res = simular(parametros_cenario("F1E", horizonte=400), seed=0)   # "F1" e "F1C" são o bloco central
 infectados = res["n_inf_faixa"].sum(axis=1)
 ```
 
