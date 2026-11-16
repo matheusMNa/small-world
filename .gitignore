@@ -5,3 +5,5 @@ logs/
 # cache do Python
 __pycache__/
 *.pyc
+results_v1/
+results_v1/
