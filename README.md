@@ -22,7 +22,7 @@ $$P_i(t) = W_L \sum_{j \in \mathcal{V}_i} T_j(t) + W_M \sum_{k=1}^{K} T_{j_k}(t)
 
 em que $\mathcal{V}_i$ é a vizinhança de Moore de $i$ e os $K$ indivíduos $j_k$ são sorteados uniformemente em toda a população, de novo a cada passo, com peso $W_M < W_L$ por representarem contatos mais breves. Um suscetível é infectado com probabilidade
 
-$$p_i^{\text{inf}} = 1 - \exp\!\left(-\alpha\, S_i\, P_i\right),$$
+$$p_i^{\text{inf}} = 1 - \exp \ \left(-\alpha\, S_i\, P_i\right),$$
 
 passando de $(S_i^0, 0)$ para $(0, T_i^0)$. Um infectado se recupera com probabilidade $p_{\text{rec}}$ a cada passo, passando de $(0, T_i^0)$ para $(0, 0)$.
 
